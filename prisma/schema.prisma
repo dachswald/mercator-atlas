@@ -1,0 +1,78 @@
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Broker {
+  id           String              @id @default(uuid())
+  name         String
+  email        String              @unique
+  policies     PolicyTransaction[]
+  createdAt    DateTime            @default(now())
+}
+
+model ClientSME {
+  id             String              @id @default(uuid())
+  companyName    String
+  companyNumber  String              @unique
+  annualTurnover Float
+  employeeCount  Int
+  sicCode        String
+  policies       PolicyTransaction[]
+  createdAt      DateTime            @default(now())
+}
+
+model DABinderFacility {
+  id                String              @id @default(uuid())
+  facilityCode      String              @unique
+  totalCapacity     Float
+  remainingCapacity Float
+  rateCardJson      String
+  policies          PolicyTransaction[]
+  createdAt         DateTime            @default(now())
+}
+
+model PolicyTransaction {
+  id                  String           @id @default(uuid())
+  policyNumber        String           @unique
+  facilityId          String
+  brokerId            String
+  smeId               String
+  status              String           @default("BOUND")
+  netPremium          Float
+  iptAmount           Float
+  grossPremium        Float
+  brokerCommission    Float
+  riskDetailsSnapshot String
+  demandsAndNeedsJson String?
+  ipidDeliveredAt     DateTime?
+  boundAt             DateTime         @default(now())
+
+  facility            DABinderFacility @relation(fields: [facilityId], references: [id])
+  broker              Broker           @relation(fields: [brokerId], references: [id])
+  sme                 ClientSME        @relation(fields: [smeId], references: [id])
+}
+
+model DiallerQueueItem {
+  id                String    @id @default(uuid())
+  companyName       String
+  companyNumber     String    @unique
+  sicCode           String
+  contactPhone      String
+  contactEmail      String?
+  estimatedTurnover Float
+  employeeCount     Int
+  tpsStatus         String    @default("PENDING")
+  tpsCheckedAt      DateTime?
+  indicativeNet     Float?
+  indicativeGross   Float?
+  queueStatus       String    @default("QUEUED")
+  ipidAccessKey     String?   @unique
+  ipidDeliveredAt   DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+}
