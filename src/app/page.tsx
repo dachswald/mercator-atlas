@@ -18,7 +18,10 @@ interface StagedLead {
 }
 
 export default function DiallerDesk() {
-  const [queueCount, setQueueCount] = useState<number>(0);
+  const [activeRole, setActiveRole] = useState<'SDR' | 'CLOSER'>('SDR');
+  const [sdrQueueCount, setSdrQueueCount] = useState<number>(0);
+  const [closerPendingCount, setCloserPendingCount] = useState<number>(0);
+
   const [activeLead, setActiveLead] = useState<StagedLead | null>(null);
   const [dialling, setDialling] = useState<boolean>(false);
   const [binding, setBinding] = useState<boolean>(false);
@@ -26,21 +29,33 @@ export default function DiallerDesk() {
   const [ipidLink, setIpidLink] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>('Floor Ready. Idle.');
 
-  async function refreshQueue() {
+  // SDR verification edit state
+  const [verifiedTurnover, setVerifiedTurnover] = useState<number>(0);
+  const [verifiedEmployees, setVerifiedEmployees] = useState<number>(0);
+
+  async function refreshTelemetry() {
     try {
-      const res = await fetch('/api/dialler/queue?status=QUEUED');
-      if (res.ok) {
-        const data = await res.json();
-        setQueueCount(data.count);
+      const [sdrRes, closerRes] = await Promise.all([
+        fetch('/api/dialler/queue?status=QUEUED'),
+        fetch('/api/dialler/queue?status=READY_FOR_CLOSER')
+      ]);
+
+      if (sdrRes.ok) {
+        const d = await sdrRes.json();
+        setSdrQueueCount(d.count);
+      }
+      if (closerRes.ok) {
+        const d = await closerRes.json();
+        setCloserPendingCount(d.count);
       }
     } catch (e) {
-      console.error('Queue poll failed', e);
+      console.error('Telemetry fetch failed', e);
     }
   }
 
   useEffect(() => {
-    refreshQueue();
-    const interval = setInterval(refreshQueue, 5000);
+    refreshTelemetry();
+    const interval = setInterval(refreshTelemetry, 4000);
     return () => clearInterval(interval);
   }, []);
 
@@ -53,49 +68,103 @@ export default function DiallerDesk() {
         body: JSON.stringify({ targetSicCode: '49410', batchLimit: 10 })
       });
       const data = await res.json();
-      setStatusMessage(
-        `Batch Complete: ${data.summary.ingested} leads queued, ${data.summary.suppressed} suppressed by PECR.`
-      );
-      refreshQueue();
+      setStatusMessage(`Ingested ${data.summary.ingested} leads, ${data.summary.suppressed} suppressed.`);
+      refreshTelemetry();
     } catch (e: any) {
       setStatusMessage(`Crawler failed: ${e.message}`);
     }
   }
 
-  async function handleNextCall() {
+  // SDR Action: Dial next cold lead
+  async function handleSdrDialNext() {
     setDialling(true);
-    setStatusMessage('Progressive Dialler: Ringing next screened lead...');
+    setStatusMessage('Progressive Dialler: Ringing next screened prospect...');
     setActiveLead(null);
-    setIpidLink(null);
 
     try {
       const res = await fetch('/api/dialler/claim-next', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ brokerId: 'eleanor.vance@mercator-atlas.example' })
+        body: JSON.stringify({ brokerId: 'sdr-tier-01' })
       });
 
       if (res.status === 404) {
-        setStatusMessage('Queue dry. Run crawler to ingest fresh leads.');
+        setStatusMessage('SDR queue empty. Ingest more leads.');
         setDialling(false);
         return;
       }
 
       const data = await res.json();
       setActiveLead(data.lead);
-      setStatusMessage(`Call Connected: ${data.lead.companyName} (${data.lead.contactPhone})`);
-      refreshQueue();
+      setVerifiedTurnover(data.lead.estimatedTurnover);
+      setVerifiedEmployees(data.lead.employeeCount);
+      setStatusMessage(`Connected: ${data.lead.companyName} (${data.lead.contactPhone})`);
+      refreshTelemetry();
     } catch (e: any) {
-      setStatusMessage(`Call bridge failed: ${e.message}`);
+      setStatusMessage(`Call failed: ${e.message}`);
     } finally {
       setDialling(false);
     }
   }
 
+  // SDR Action: Complete fact-finding and initiate warm transfer
+  async function handleTransferToCloser() {
+    if (!activeLead) return;
+    setStatusMessage(`Transferring ${activeLead.companyName} to onshore licensed closer...`);
+
+    try {
+      const res = await fetch('/api/dialler/transfer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          leadId: activeLead.id,
+          verifiedTurnover,
+          verifiedEmployees,
+          sdrId: 'sdr-tier-01'
+        })
+      });
+
+      if (!res.ok) throw new Error('Transfer dispatch failed');
+
+      setStatusMessage('Lead transferred to licensed closer queue. Returning to dialler pool.');
+      setActiveLead(null);
+      refreshTelemetry();
+    } catch (e: any) {
+      setStatusMessage(`Transfer failed: ${e.message}`);
+    }
+  }
+
+  // Closer Action: Accept next verified warm transfer
+  async function handleCloserAcceptLead() {
+    setStatusMessage('Accepting next verified inbound warm transfer...');
+    setActiveLead(null);
+    setIpidLink(null);
+
+    try {
+      const res = await fetch('/api/dialler/closer-claim', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+
+      if (res.status === 404) {
+        setStatusMessage('No transferred leads pending in closer pool.');
+        return;
+      }
+
+      const data = await res.json();
+      setActiveLead(data.lead);
+      setStatusMessage(`Warm Call Bridge Active: ${data.lead.companyName}`);
+      refreshTelemetry();
+    } catch (e: any) {
+      setStatusMessage(`Closer claim failed: ${e.message}`);
+    }
+  }
+
+  // Closer Action: Deliver IPID
   async function handleDeliverIpid() {
     if (!activeLead) return;
     setSendingIpid(true);
-    setStatusMessage('Generating Demands & Needs and delivering durable IPID link...');
+    setStatusMessage('Compiling Demands & Needs and generating durable IPID link...');
 
     try {
       const res = await fetch('/api/idd/ipid', {
@@ -107,7 +176,7 @@ export default function DiallerDesk() {
         })
       });
 
-      if (!res.ok) throw new Error(`IPID delivery failed with status ${res.status}`);
+      if (!res.ok) throw new Error('IPID generation failed');
 
       const data = await res.json();
       setIpidLink(data.durableUrl);
@@ -117,15 +186,15 @@ export default function DiallerDesk() {
       });
       setStatusMessage('IPID Delivered. IDD Compliance Gate cleared for 1-click bind.');
     } catch (e: any) {
-      setStatusMessage(`IPID error: ${e.message}`);
+      setStatusMessage(`IPID delivery failed: ${e.message}`);
     } finally {
       setSendingIpid(false);
     }
   }
 
+  // Closer Action: 1-Click Bind
   async function handleBindAndIssue() {
     if (!activeLead) return;
-
     setBinding(true);
     setStatusMessage(`Binding coverage for ${activeLead.companyName}...`);
 
@@ -143,7 +212,7 @@ export default function DiallerDesk() {
 
       if (!bindResponse.ok) {
         const errorData = await bindResponse.json();
-        throw new Error(errorData.error || `Bind rejected with code ${bindResponse.status}`);
+        throw new Error(errorData.error || `Bind rejected (${bindResponse.status})`);
       }
 
       const blob = await bindResponse.blob();
@@ -156,10 +225,10 @@ export default function DiallerDesk() {
       a.remove();
       window.URL.revokeObjectURL(url);
 
-      setStatusMessage(`Policy Bound & Issued! Schedule PDF downloaded.`);
+      setStatusMessage('Policy Bound & Issued! Schedule PDF downloaded.');
       setActiveLead(null);
       setIpidLink(null);
-      refreshQueue();
+      refreshTelemetry();
     } catch (e: any) {
       setStatusMessage(`Bind execution failed: ${e.message}`);
     } finally {
@@ -172,174 +241,296 @@ export default function DiallerDesk() {
   }
 
   return (
-    <main style={{ maxWidth: 760, margin: '40px auto', background: '#ffffff', padding: 32, borderRadius: 8, boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
+    <main style={{ maxWidth: 840, margin: '30px auto', background: '#ffffff', padding: 32, borderRadius: 8, boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
+      {/* Role-Mode Selector */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#0f172a', padding: '12px 20px', borderRadius: 6, marginBottom: 24, color: '#ffffff' }}>
+        <div>
+          <span style={{ fontSize: 13, textTransform: 'uppercase', color: '#94a3b8', letterSpacing: '0.05em' }}>Operational Mode:</span>
+          <strong style={{ marginLeft: 8, fontSize: 15, color: activeRole === 'SDR' ? '#38bdf8' : '#4ade80' }}>
+            {activeRole === 'SDR' ? 'Offshore SDR (Fact-Finding Only)' : 'Licensed Broker (Closer)'}
+          </strong>
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            onClick={() => { setActiveRole('SDR'); setActiveLead(null); }}
+            style={{
+              padding: '6px 14px',
+              fontSize: 13,
+              fontWeight: 600,
+              background: activeRole === 'SDR' ? '#38bdf8' : '#334155',
+              color: activeRole === 'SDR' ? '#0f172a' : '#ffffff',
+              border: 'none',
+              borderRadius: 4,
+              cursor: 'pointer'
+            }}
+          >
+            SDR Mode
+          </button>
+          <button
+            onClick={() => { setActiveRole('CLOSER'); setActiveLead(null); }}
+            style={{
+              padding: '6px 14px',
+              fontSize: 13,
+              fontWeight: 600,
+              background: activeRole === 'CLOSER' ? '#4ade80' : '#334155',
+              color: activeRole === 'CLOSER' ? '#0f172a' : '#ffffff',
+              border: 'none',
+              borderRadius: 4,
+              cursor: 'pointer'
+            }}
+          >
+            Closer Mode
+          </button>
+        </div>
+      </div>
+
+      {/* Telemetry Header */}
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #e2e8f0', paddingBottom: 16, marginBottom: 24 }}>
         <div>
-          <h1 style={{ margin: 0, fontSize: 22 }}>Mercator-Atlas High-Velocity Desk</h1>
-          <p style={{ margin: '4px 0 0 0', color: '#64748b', fontSize: 14 }}>
-            DA Facility: <strong>DA-PI-2026</strong> | Broker: <strong>Eleanor Vance</strong>
+          <h1 style={{ margin: 0, fontSize: 20 }}>Mercator-Atlas High-Velocity Desk</h1>
+          <p style={{ margin: '4px 0 0 0', color: '#64748b', fontSize: 13 }}>
+            Binder: <strong>DA-PI-2026</strong> | Compliance: <strong>EU IDD / UK FCA Gated</strong>
           </p>
         </div>
-        <div style={{ textAlign: 'right' }}>
-          <div style={{ fontSize: 24, fontWeight: 700, color: queueCount > 0 ? '#059669' : '#94a3b8' }}>
-            {queueCount}
+        <div style={{ display: 'flex', gap: 20, textAlign: 'right' }}>
+          <div>
+            <div style={{ fontSize: 22, fontWeight: 700, color: '#0284c7' }}>{sdrQueueCount}</div>
+            <div style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase' }}>SDR Cold Queue</div>
           </div>
-          <div style={{ fontSize: 12, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-            Screened In Queue
+          <div>
+            <div style={{ fontSize: 22, fontWeight: 700, color: '#16a34a' }}>{closerPendingCount}</div>
+            <div style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase' }}>Warm Transfers Ready</div>
           </div>
         </div>
       </header>
 
-      {/* Primary Action Buttons */}
+      {/* Action Bar */}
       <div style={{ display: 'flex', gap: 12, marginBottom: 24 }}>
-        <button
-          onClick={handleNextCall}
-          disabled={dialling || binding || queueCount === 0}
-          style={{
-            flex: 2,
-            padding: '14px 20px',
-            background: dialling || queueCount === 0 ? '#94a3b8' : '#2563eb',
-            color: '#ffffff',
-            fontWeight: 600,
-            fontSize: 16,
-            border: 'none',
-            borderRadius: 6,
-            cursor: dialling || queueCount === 0 ? 'not-allowed' : 'pointer'
-          }}
-        >
-          {dialling ? 'Connecting Call...' : '▶ Dial Next Lead'}
-        </button>
-
-        <button
-          onClick={handleTriggerCrawler}
-          disabled={dialling || binding}
-          style={{
-            flex: 1,
-            padding: '14px 16px',
-            background: '#f1f5f9',
-            color: '#334155',
-            fontWeight: 600,
-            fontSize: 14,
-            border: '1px solid #cbd5e1',
-            borderRadius: 6,
-            cursor: 'pointer'
-          }}
-        >
-          + Ingest SIC 49410
-        </button>
-
-        <button
-          onClick={handleDownloadBordereau}
-          style={{
-            flex: 1,
-            padding: '14px 16px',
-            background: '#ffffff',
-            color: '#0f172a',
-            fontWeight: 600,
-            fontSize: 14,
-            border: '1px solid #0f172a',
-            borderRadius: 6,
-            cursor: 'pointer'
-          }}
-        >
-          ⬇ Bordereau
-        </button>
+        {activeRole === 'SDR' ? (
+          <>
+            <button
+              onClick={handleSdrDialNext}
+              disabled={dialling || sdrQueueCount === 0 || !!activeLead}
+              style={{
+                flex: 2,
+                padding: '12px 18px',
+                background: dialling || sdrQueueCount === 0 || !!activeLead ? '#94a3b8' : '#0284c7',
+                color: '#ffffff',
+                fontWeight: 600,
+                fontSize: 15,
+                border: 'none',
+                borderRadius: 6,
+                cursor: dialling || sdrQueueCount === 0 || !!activeLead ? 'not-allowed' : 'pointer'
+              }}
+            >
+              {dialling ? 'Connecting Call...' : '▶ Dial Next Lead (SDR)'}
+            </button>
+            <button
+              onClick={handleTriggerCrawler}
+              disabled={dialling}
+              style={{
+                flex: 1,
+                padding: '12px 16px',
+                background: '#f1f5f9',
+                color: '#334155',
+                fontWeight: 600,
+                fontSize: 13,
+                border: '1px solid #cbd5e1',
+                borderRadius: 6,
+                cursor: 'pointer'
+              }}
+            >
+              + Scrape SIC 49410
+            </button>
+          </>
+        ) : (
+          <>
+            <button
+              onClick={handleCloserAcceptLead}
+              disabled={closerPendingCount === 0 || !!activeLead}
+              style={{
+                flex: 2,
+                padding: '12px 18px',
+                background: closerPendingCount === 0 || !!activeLead ? '#94a3b8' : '#16a34a',
+                color: '#ffffff',
+                fontWeight: 600,
+                fontSize: 15,
+                border: 'none',
+                borderRadius: 6,
+                cursor: closerPendingCount === 0 || !!activeLead ? 'not-allowed' : 'pointer'
+              }}
+            >
+              ⚡ Accept Warm Transfer ({closerPendingCount} Ready)
+            </button>
+            <button
+              onClick={handleDownloadBordereau}
+              style={{
+                flex: 1,
+                padding: '12px 16px',
+                background: '#ffffff',
+                color: '#0f172a',
+                fontWeight: 600,
+                fontSize: 13,
+                border: '1px solid #0f172a',
+                borderRadius: 6,
+                cursor: 'pointer'
+              }}
+            >
+              ⬇ Export Bordereau
+            </button>
+          </>
+        )}
       </div>
 
       {/* Screen-Pop Active Call Container */}
-      {activeLead ? (
-        <div style={{ border: '2px solid #3b82f6', borderRadius: 8, padding: 20, background: '#eff6ff', marginBottom: 24 }}>
+      {activeLead && (
+        <div style={{ border: '2px solid #2563eb', borderRadius: 8, padding: 20, background: '#f8fafc', marginBottom: 24 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 12 }}>
             <span style={{ fontSize: 12, fontWeight: 700, color: '#1d4ed8', background: '#dbeafe', padding: '2px 8px', borderRadius: 4 }}>
-              LIVE CALL CONNECTED
+              {activeRole === 'SDR' ? 'COLD OUTREACH CALL CONNECTED' : 'WARM TRANSFER CONNECTED'}
             </span>
             <span style={{ fontSize: 13, color: '#475569' }}>
-              CRN: <strong>{activeLead.companyNumber}</strong> | Phone: <strong>{activeLead.contactPhone}</strong>
+              CRN: <strong>{activeLead.companyNumber}</strong> | Tel: <strong>{activeLead.contactPhone}</strong>
             </span>
           </div>
 
-          <h2 style={{ margin: '0 0 16px 0', fontSize: 20, color: '#1e293b' }}>
+          <h2 style={{ margin: '0 0 16px 0', fontSize: 20, color: '#0f172a' }}>
             {activeLead.companyName}
           </h2>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, background: '#ffffff', padding: 16, borderRadius: 6, marginBottom: 16 }}>
+          {/* SDR Fact-Finding View */}
+          {activeRole === 'SDR' ? (
             <div>
-              <div style={{ fontSize: 12, color: '#64748b' }}>Industry / SIC</div>
-              <div style={{ fontWeight: 600 }}>Freight Road Transport ({activeLead.sicCode})</div>
-            </div>
-            <div>
-              <div style={{ fontSize: 12, color: '#64748b' }}>Headcount & Turnover</div>
-              <div style={{ fontWeight: 600 }}>{activeLead.employeeCount} Staff | £{activeLead.estimatedTurnover.toLocaleString()}</div>
-            </div>
-            <div>
-              <div style={{ fontSize: 12, color: '#64748b' }}>Indicative Net Premium</div>
-              <div style={{ fontWeight: 600, color: '#0f172a' }}>£{activeLead.indicativeNet?.toFixed(2)}</div>
-            </div>
-            <div>
-              <div style={{ fontSize: 12, color: '#64748b' }}>Gross (incl. 12% IPT)</div>
-              <div style={{ fontSize: 18, fontWeight: 700, color: '#059669' }}>
-                £{activeLead.indicativeGross?.toFixed(2)}
+              <div style={{ background: '#fef3c7', padding: 12, borderRadius: 6, marginBottom: 16, fontSize: 13, color: '#92400e', border: '1px solid #fde68a' }}>
+                <strong>FCA Regulatory Guardrail:</strong> You may verify factual numbers only. Do not advise, discuss cover terms, or quote binding figures.
               </div>
-            </div>
-          </div>
 
-          {/* IDD Delivery Gate Controls */}
-          <div style={{ background: '#ffffff', padding: 14, borderRadius: 6, marginBottom: 16, border: '1px solid #cbd5e1' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div>
-                <span style={{ fontSize: 13, fontWeight: 700, color: activeLead.ipidDeliveredAt ? '#059669' : '#d97706' }}>
-                  {activeLead.ipidDeliveredAt ? '✓ IDD Delivery Gate: CLEARED' : '⚠ IDD Gate: IPID Delivery Required'}
-                </span>
-                {ipidLink && (
-                  <div style={{ fontSize: 12, marginTop: 4 }}>
-                    <a href={ipidLink} target="_blank" rel="noreferrer" style={{ color: '#2563eb', textDecoration: 'underline' }}>
-                      Open Dispatched IPID Document ↗
-                    </a>
-                  </div>
-                )}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, background: '#ffffff', padding: 16, borderRadius: 6, marginBottom: 16, border: '1px solid #e2e8f0' }}>
+                <div>
+                  <label style={{ display: 'block', fontSize: 12, color: '#64748b', marginBottom: 4, fontWeight: 600 }}>
+                    Verified Annual Turnover (£)
+                  </label>
+                  <input
+                    type="number"
+                    value={verifiedTurnover}
+                    onChange={(e) => setVerifiedTurnover(parseFloat(e.target.value) || 0)}
+                    style={{ width: '90%', padding: '8px 12px', border: '1px solid #cbd5e1', borderRadius: 4, fontSize: 14 }}
+                  />
+                </div>
+
+                <div>
+                  <label style={{ display: 'block', fontSize: 12, color: '#64748b', marginBottom: 4, fontWeight: 600 }}>
+                    Verified Employee Count
+                  </label>
+                  <input
+                    type="number"
+                    value={verifiedEmployees}
+                    onChange={(e) => setVerifiedEmployees(parseInt(e.target.value, 10) || 0)}
+                    style={{ width: '90%', padding: '8px 12px', border: '1px solid #cbd5e1', borderRadius: 4, fontSize: 14 }}
+                  />
+                </div>
               </div>
+
               <button
-                onClick={handleDeliverIpid}
-                disabled={sendingIpid || !!activeLead.ipidDeliveredAt}
+                onClick={handleTransferToCloser}
                 style={{
-                  padding: '8px 14px',
-                  background: activeLead.ipidDeliveredAt ? '#e2e8f0' : '#d97706',
-                  color: activeLead.ipidDeliveredAt ? '#64748b' : '#ffffff',
+                  width: '100%',
+                  padding: '14px 20px',
+                  background: '#0284c7',
+                  color: '#ffffff',
                   fontWeight: 600,
-                  fontSize: 13,
+                  fontSize: 15,
                   border: 'none',
-                  borderRadius: 4,
-                  cursor: activeLead.ipidDeliveredAt ? 'default' : 'pointer'
+                  borderRadius: 6,
+                  cursor: 'pointer'
                 }}
               >
-                {sendingIpid ? 'Generating...' : activeLead.ipidDeliveredAt ? 'IPID Dispatched' : 'Deliver IPID Link'}
+                Transfer to Licensed Closer Desk ➔
               </button>
             </div>
-          </div>
+          ) : (
+            /* Closer View */
+            <div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, background: '#ffffff', padding: 16, borderRadius: 6, marginBottom: 16, border: '1px solid #e2e8f0' }}>
+                <div>
+                  <div style={{ fontSize: 12, color: '#64748b' }}>Industry / SIC</div>
+                  <div style={{ fontWeight: 600 }}>Freight Road Transport ({activeLead.sicCode})</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: 12, color: '#64748b' }}>Verified Risk Profile</div>
+                  <div style={{ fontWeight: 600 }}>{activeLead.employeeCount} Staff | £{activeLead.estimatedTurnover.toLocaleString()}</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: 12, color: '#64748b' }}>Net Premium</div>
+                  <div style={{ fontWeight: 600 }}>£{activeLead.indicativeNet?.toFixed(2)}</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: 12, color: '#64748b' }}>Gross (incl. 12% IPT)</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: '#16a34a' }}>
+                    £{activeLead.indicativeGross?.toFixed(2)}
+                  </div>
+                </div>
+              </div>
 
-          <button
-            onClick={handleBindAndIssue}
-            disabled={binding || !activeLead.ipidDeliveredAt}
-            style={{
-              width: '100%',
-              padding: '14px 20px',
-              background: binding || !activeLead.ipidDeliveredAt ? '#94a3b8' : '#059669',
-              color: '#ffffff',
-              fontWeight: 600,
-              fontSize: 16,
-              border: 'none',
-              borderRadius: 6,
-              cursor: binding || !activeLead.ipidDeliveredAt ? 'not-allowed' : 'pointer'
-            }}
-          >
-            {binding
-              ? 'Executing Atomic Bind...'
-              : !activeLead.ipidDeliveredAt
-              ? '🔒 IPID Delivery Required to Unlock Bind'
-              : '⚡ 1-Click Bind & Issue Policy Schedule'}
-          </button>
+              {/* IDD Gate Controls */}
+              <div style={{ background: '#ffffff', padding: 14, borderRadius: 6, marginBottom: 16, border: '1px solid #cbd5e1' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: activeLead.ipidDeliveredAt ? '#16a34a' : '#d97706' }}>
+                      {activeLead.ipidDeliveredAt ? '✓ IDD Delivery Gate: CLEARED' : '⚠ IDD Gate: IPID Delivery Required'}
+                    </span>
+                    {ipidLink && (
+                      <div style={{ fontSize: 12, marginTop: 4 }}>
+                        <a href={ipidLink} target="_blank" rel="noreferrer" style={{ color: '#2563eb', textDecoration: 'underline' }}>
+                          Open Dispatched IPID Document ↗
+                        </a>
+                      </div>
+                    )}
+                  </div>
+                  <button
+                    onClick={handleDeliverIpid}
+                    disabled={sendingIpid || !!activeLead.ipidDeliveredAt}
+                    style={{
+                      padding: '8px 14px',
+                      background: activeLead.ipidDeliveredAt ? '#e2e8f0' : '#d97706',
+                      color: activeLead.ipidDeliveredAt ? '#64748b' : '#ffffff',
+                      fontWeight: 600,
+                      fontSize: 13,
+                      border: 'none',
+                      borderRadius: 4,
+                      cursor: activeLead.ipidDeliveredAt ? 'default' : 'pointer'
+                    }}
+                  >
+                    {sendingIpid ? 'Generating...' : activeLead.ipidDeliveredAt ? 'IPID Dispatched' : 'Deliver IPID Link'}
+                  </button>
+                </div>
+              </div>
+
+              <button
+                onClick={handleBindAndIssue}
+                disabled={binding || !activeLead.ipidDeliveredAt}
+                style={{
+                  width: '100%',
+                  padding: '14px 20px',
+                  background: binding || !activeLead.ipidDeliveredAt ? '#94a3b8' : '#16a34a',
+                  color: '#ffffff',
+                  fontWeight: 600,
+                  fontSize: 16,
+                  border: 'none',
+                  borderRadius: 6,
+                  cursor: binding || !activeLead.ipidDeliveredAt ? 'not-allowed' : 'pointer'
+                }}
+              >
+                {binding
+                  ? 'Executing Atomic Bind...'
+                  : !activeLead.ipidDeliveredAt
+                  ? '🔒 IPID Delivery Required to Unlock Bind'
+                  : '⚡ 1-Click Bind & Issue Policy Schedule'}
+              </button>
+            </div>
+          )}
         </div>
-      ) : null}
+      )}
 
       {/* Telemetry Status Bar */}
       <footer style={{ background: '#f8fafc', padding: 12, borderRadius: 6, border: '1px solid #e2e8f0', fontSize: 13, color: '#475569' }}>

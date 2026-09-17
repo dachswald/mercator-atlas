@@ -11,6 +11,7 @@ model Broker {
   id           String              @id @default(uuid())
   name         String
   email        String              @unique
+  role         String              @default("CLOSER") // SDR | CLOSER
   policies     PolicyTransaction[]
   createdAt    DateTime            @default(now())
 }
@@ -70,7 +71,8 @@ model DiallerQueueItem {
   tpsCheckedAt      DateTime?
   indicativeNet     Float?
   indicativeGross   Float?
-  queueStatus       String    @default("QUEUED")
+  queueStatus       String    @default("QUEUED") // QUEUED | SDR_ENGAGED | READY_FOR_CLOSER | CONVERTED | EXCLUDED
+  verifiedBySdrId   String?
   ipidAccessKey     String?   @unique
   ipidDeliveredAt   DateTime?
   createdAt         DateTime  @default(now())
